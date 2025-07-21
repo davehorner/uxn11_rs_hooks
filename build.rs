@@ -1,14 +1,9 @@
 fn main() {
-    cc::Build::new()
-        .file("c/uxn11.c")
-        .warnings(true)
-        .flag_if_supported("-Wall")
-        .flag_if_supported("-Wextra")
-        .flag_if_supported("-O2")
-        .compile("uxn11");
+    // Use system-wide static library from /usr/local/lib
+    println!("cargo:rustc-link-search=native=/usr/local/lib");
     println!("cargo:rustc-link-lib=static=uxn11");
-    println!("cargo:rustc-link-search=native={}", std::env::var("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-changed=c/uxn11.c");
+    println!("cargo:rustc-link-lib=X11");
+    println!("cargo:rustc-link-lib=util");
     // Generate Rust bindings from C header using bindgen
     let bindings = bindgen::Builder::default()
         .header("c/uxn11.h")
@@ -19,6 +14,11 @@ fn main() {
     bindings
         .write_to_file(out_path.join("uxn11_bindings.rs"))
         .expect("Couldn't write bindings!");
-    // Verbose output for diagnostics
-    println!("cargo:warning=build.rs completed");
+    // Diagnostics: check for c/libuxn11.a
+    let lib_path = std::path::Path::new("c/libuxn11.a");
+    if lib_path.exists() {
+        println!("cargo:warning=Found static library: c/libuxn11.a");
+    } else {
+        println!("cargo:warning=Missing static library: c/libuxn11.a");
+    }
 }

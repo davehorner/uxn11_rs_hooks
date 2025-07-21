@@ -1,0 +1,1292 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysymdef.h>
+#include <sys/timerfd.h>
+#include <poll.h>
+
+
+// Rust callback storage
+#include <stdint.h>
+static void (*rust_port_callback)(uint8_t port, uint8_t value) = NULL;
+
+// FFI: Register callback from Rust
+// FFI: Register callback from Rust
+#ifdef __cplusplus
+extern "C" {
+#endif
+void register_port_callback(void *cb) {
+	rust_port_callback = (void (*)(uint8_t, uint8_t))cb;
+}
+#ifdef __cplusplus
+}
+#endif
+
+// FFI: Called from emu_deo for all port events
+#ifdef __cplusplus
+extern "C" {
+#endif
+void rust_deo_all_ports_hook(uint8_t port, uint8_t value) {
+	if (rust_port_callback) {
+		rust_port_callback(port, value);
+	}
+}
+#ifdef __cplusplus
+}
+#endif
+
+
+/*
+Copyright (c) 2021-2025 Devine Lu Linvega, Andrew Alderwick, 
+Andrew Richards, Eiríkr Åsheim, Sigrid Solveig Haflínudóttir
+David Horner
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE.
+
+cc -DNDEBUG -O2 -g0 -s src/uxn11.c -lX11 -lutil -o bin/uxn11
+*/
+
+typedef unsigned char Uint8;
+typedef unsigned short Uint16;
+
+typedef struct {
+	Uint8 dat[0x100], ptr;
+} Stack;
+
+static XImage *ximage;
+static Display *display;
+static Window window;
+static Uint8 *ram, dev[0x100];
+static Stack wst, rst;
+
+Uint8 emu_dei(const Uint8 port);
+void emu_deo(const Uint8 port, const Uint8 value);
+
+/* clang-format off */
+
+#define BANKS 0x10
+#define BANKS_CAP BANKS * 0x10000
+
+#define WIDTH (64 * 8)
+#define HEIGHT (40 * 8)
+#define PEEK2(d) (*(d) << 8 | (d)[1])
+#define POKE2(d, v) { *(d) = (v) >> 8; (d)[1] = (v); }
+#define clamp(v,a,b) { if(v < a) v = a; else if(v >= b) v = b; }
+#define twos(v) (v & 0x8000 ? (int)v - 0x10000 : (int)v)
+
+#define OPC(opc, A, B) {\
+	case 0x00|opc: {const int _2=0,_r=0;A B;} break;\
+	case 0x20|opc: {const int _2=1,_r=0;A B;} break;\
+	case 0x40|opc: {const int _2=0,_r=1;A B;} break;\
+	case 0x60|opc: {const int _2=1,_r=1;A B;} break;\
+	case 0x80|opc: {const int _2=0,_r=0;int k=wst.ptr;A wst.ptr=k;B;} break;\
+	case 0xa0|opc: {const int _2=1,_r=0;int k=wst.ptr;A wst.ptr=k;B;} break;\
+	case 0xc0|opc: {const int _2=0,_r=1;int k=rst.ptr;A rst.ptr=k;B;} break;\
+	case 0xe0|opc: {const int _2=1,_r=1;int k=rst.ptr;A rst.ptr=k;B;} break;\
+}
+
+/* Microcode */
+
+#define REM if(_r) rst.ptr -= 1 + _2; else wst.ptr -= 1 + _2;
+#define IMM(o) o = ram[pc] << 8 | ram[pc + 1], pc += 2;
+#define MOV(x) { if(_2) pc = x; else pc += (signed char)x; }
+#define DEC(s) s.dat[--s.ptr]
+#define PO1(o) { if(_r) o = DEC(rst); else o = DEC(wst); }
+#define PO2(o) { PO1(o) if(_r) o |= DEC(rst) << 8; else o |= DEC(wst) << 8; }
+#define POx(o) { if(_2) PO2(o) else PO1(o) }
+#define GOT(o) { if(_2) PO1(o[1]) PO1(o[0]) }
+#define INC(s) s.dat[s.ptr++]
+#define RP1(i) { if(_r) INC(wst) = i; else INC(rst) = i; }
+#define PU1(i) { if(_r) INC(rst) = i; else INC(wst) = i; }
+#define PUx(i) { if(_2) { c = (i); PU1(c >> 8) PU1(c) } else PU1(i) }
+#define PUT(i) { PU1(i[0]) if(_2) PU1(i[1]) }
+#define DEI(i,o) o[0] = emu_dei(i); if(_2) o[1] = emu_dei(i + 1); PUT(o)
+#define DEO(i,j) emu_deo(i, j[0]); if(_2) emu_deo(i + 1, j[1]);
+#define PEK(i,o,m) o[0] = ram[i]; if(_2) o[1] = ram[(i + 1) & m]; PUT(o)
+#define POK(i,j,m) ram[i] = j[0]; if(_2) ram[(i + 1) & m] = j[1];
+
+static unsigned int
+uxn_eval(unsigned short pc)
+{
+	unsigned int a, b, c, x[2], y[2], z[2], step = 0x8000000;
+	while(step--) {
+		switch(ram[pc++]) {
+		/* BRK */ case 0x00: return 1;
+		/* JCI */ case 0x20: IMM(c) if(DEC(wst)) pc += c; break;
+		/* JMI */ case 0x40: IMM(c) pc += c; break;
+		/* JSI */ case 0x60: IMM(c) INC(rst) = pc >> 8, INC(rst) = pc, pc += c; break;
+		/* LI2 */ case 0xa0: INC(wst) = ram[pc++]; /* fall-through */
+		/* LIT */ case 0x80: INC(wst) = ram[pc++]; break;
+		/* L2r */ case 0xe0: INC(rst) = ram[pc++]; /* fall-through */
+		/* LIr */ case 0xc0: INC(rst) = ram[pc++]; break;
+		/* INC */ OPC(0x01,POx(a),PUx(a + 1))
+		/* POP */ OPC(0x02,REM,{})
+		/* NIP */ OPC(0x03,GOT(x) REM,PUT(x))
+		/* SWP */ OPC(0x04,GOT(x) GOT(y),PUT(x) PUT(y))
+		/* ROT */ OPC(0x05,GOT(x) GOT(y) GOT(z),PUT(y) PUT(x) PUT(z))
+		/* DUP */ OPC(0x06,GOT(x),PUT(x) PUT(x))
+		/* OVR */ OPC(0x07,GOT(x) GOT(y),PUT(y) PUT(x) PUT(y))
+		/* EQU */ OPC(0x08,POx(a) POx(b),PU1(b == a))
+		/* NEQ */ OPC(0x09,POx(a) POx(b),PU1(b != a))
+		/* GTH */ OPC(0x0a,POx(a) POx(b),PU1(b > a))
+		/* LTH */ OPC(0x0b,POx(a) POx(b),PU1(b < a))
+		/* JMP */ OPC(0x0c,POx(a),MOV(a))
+		/* JCN */ OPC(0x0d,POx(a) PO1(b),if(b) MOV(a))
+		/* JSR */ OPC(0x0e,POx(a),RP1(pc >> 8) RP1(pc) MOV(a))
+		/* STH */ OPC(0x0f,GOT(x),RP1(x[0]) if(_2) RP1(x[1]))
+		/* LDZ */ OPC(0x10,PO1(a),PEK(a, x, 0xff))
+		/* STZ */ OPC(0x11,PO1(a) GOT(y),POK(a, y, 0xff))
+		/* LDR */ OPC(0x12,PO1(a),PEK(pc + (signed char)a, x, 0xffff))
+		/* STR */ OPC(0x13,PO1(a) GOT(y),POK(pc + (signed char)a, y, 0xffff))
+		/* LDA */ OPC(0x14,PO2(a),PEK(a, x, 0xffff))
+		/* STA */ OPC(0x15,PO2(a) GOT(y),POK(a, y, 0xffff))
+		/* DEI */ OPC(0x16,PO1(a),DEI(a, x))
+		/* DEO */ OPC(0x17,PO1(a) GOT(y),DEO(a, y))
+		/* ADD */ OPC(0x18,POx(a) POx(b),PUx(b + a))
+		/* SUB */ OPC(0x19,POx(a) POx(b),PUx(b - a))
+		/* MUL */ OPC(0x1a,POx(a) POx(b),PUx(b * a))
+		/* DIV */ OPC(0x1b,POx(a) POx(b),PUx(a ? b / a : 0))
+		/* AND */ OPC(0x1c,POx(a) POx(b),PUx(b & a))
+		/* ORA */ OPC(0x1d,POx(a) POx(b),PUx(b | a))
+		/* EOR */ OPC(0x1e,POx(a) POx(b),PUx(b ^ a))
+		/* SFT */ OPC(0x1f,PO1(a) POx(b),PUx(b >> (a & 0xf) << (a >> 4)))
+		}
+	}
+	return !fprintf(stdout, "Exhausted cycles limit.\n");
+}
+
+/* clang-format on */
+
+/*
+@|System ------------------------------------------------------------ */
+
+static char *system_boot_path;
+
+static void
+system_print(const char *name, const Stack *s)
+{
+	Uint8 i;
+	fprintf(stderr, "%s ", name);
+	for(i = s->ptr - 8; i != (Uint8)(s->ptr); i++)
+		fprintf(stderr, "%02x%c", s->dat[i], i == 0xff ? '|' : ' ');
+	fprintf(stderr, "<%02x\n", s->ptr);
+}
+
+static unsigned int
+system_load(const char *rom_path)
+{
+	FILE *f = fopen(rom_path, "rb");
+	if(f) {
+		unsigned int i = 0, l = fread(ram + 0x100, 0x10000 - 0x100, 1, f);
+		while(l && ++i < BANKS)
+			l = fread(ram + i * 0x10000, 0x10000, 1, f);
+		fclose(f);
+	}
+	return !!f;
+}
+
+static unsigned int
+system_boot(char *rom_path, const unsigned int has_args)
+{
+	ram = (Uint8 *)calloc(BANKS * 0x10000, sizeof(Uint8));
+	system_boot_path = rom_path;
+	dev[0x17] = has_args;
+	return ram && system_load(rom_path);
+}
+
+static unsigned int
+system_reboot(const unsigned int soft)
+{
+	unsigned int i;
+	for(i = 0x0; i < 0x100; i++) dev[i] = 0;
+	for(i = soft ? 0x100 : 0; i < 0x10000; i++) ram[i] = 0;
+	wst.ptr = rst.ptr = 0;
+	return system_load(system_boot_path);
+}
+
+static void
+system_expansion(const Uint16 exp)
+{
+	Uint8 *aptr = ram + exp;
+	unsigned short length = PEEK2(aptr + 1), limit;
+	unsigned int bank = PEEK2(aptr + 3) * 0x10000;
+	unsigned int addr = PEEK2(aptr + 5);
+	if(ram[exp] == 0x0) {
+		unsigned int dst_value = ram[exp + 7];
+		unsigned short a = addr;
+		if(bank < BANKS_CAP)
+			for(limit = a + length; a != limit; a++)
+				ram[bank + a] = dst_value;
+	} else if(ram[exp] == 0x1) {
+		unsigned int dst_bank = PEEK2(aptr + 7) * 0x10000;
+		unsigned int dst_addr = PEEK2(aptr + 9);
+		unsigned short a = addr, c = dst_addr;
+		if(bank < BANKS_CAP && dst_bank < BANKS_CAP)
+			for(limit = a + length; a != limit; c++, a++)
+				ram[dst_bank + c] = ram[bank + a];
+	} else if(ram[exp] == 0x2) {
+		unsigned int dst_bank = PEEK2(aptr + 7) * 0x10000;
+		unsigned int dst_addr = PEEK2(aptr + 9);
+		unsigned short a = addr + length - 1, c = dst_addr + length - 1;
+		if(bank < BANKS_CAP && dst_bank < BANKS_CAP)
+			for(limit = addr - 1; a != limit; a--, c--)
+				ram[dst_bank + c] = ram[bank + a];
+	} else
+		fprintf(stderr, "Unknown command: %s\n", &ram[exp]);
+}
+
+/*
+@|Console ----------------------------------------------------------- */
+
+#define CONSOLE_STD 0x1
+#define CONSOLE_ARG 0x2
+#define CONSOLE_EOA 0x3
+#define CONSOLE_END 0x4
+
+#undef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/wait.h>
+
+#ifdef __linux
+#include <pty.h>
+#include <sys/prctl.h>
+#endif
+
+#ifdef __NetBSD__
+#include <sys/ioctl.h>
+#include <util.h>
+#endif
+
+static unsigned int console_vector;
+
+/* subprocess support */
+static char *fork_args[4] = {"/bin/sh", "-c", "", NULL};
+static int child_mode;
+static int to_child_fd[2];
+static int from_child_fd[2];
+static int saved_in;
+static int saved_out;
+static pid_t child_pid;
+
+/* child_mode:
+* 0x01: writes to child's stdin
+* 0x02: reads from child's stdout
+* 0x04: reads from child's stderr
+* 0x08: kill previous process (if any) but do not start
+* (other bits ignored for now )
+*/
+
+#define CMD_LIVE 0x15 /* 0x00 not started, 0x01 running, 0xff dead */
+#define CMD_EXIT 0x16 /* if dead, exit code of process */
+#define CMD_ADDR 0x1c /* address to read command args from */
+#define CMD_MODE 0x1e /* mode to execute, 0x00 to 0x07 */
+
+/* call after we're sure the process has exited */
+
+static void
+clean_after_child(void)
+{
+	child_pid = 0;
+	if(child_mode & 0x01) {
+		close(to_child_fd[1]);
+		dup2(saved_out, 1);
+	}
+	if(child_mode & (0x04 | 0x02)) {
+		close(from_child_fd[0]);
+		dup2(saved_in, 0);
+	}
+	child_mode = 0;
+	saved_in = -1;
+	saved_out = -1;
+}
+
+static void
+start_fork_pipe(void)
+{
+	pid_t pid;
+	pid_t parent_pid = getpid();
+	int addr = PEEK2(&dev[CMD_ADDR]);
+	fflush(stdout);
+	if(child_mode & 0x08) {
+		dev[CMD_EXIT] = dev[CMD_LIVE] = 0x00;
+		return;
+	}
+	if(child_mode & 0x01) {
+		/* parent writes to child's stdin */
+		if(pipe(to_child_fd) == -1) {
+			dev[CMD_EXIT] = dev[CMD_LIVE] = 0xff;
+			fprintf(stderr, "Pipe error to child.\n");
+			return;
+		}
+	}
+	if(child_mode & (0x04 | 0x02)) {
+		/* parent reads from child's stdout and/or stderr */
+		if(pipe(from_child_fd) == -1) {
+			dev[CMD_EXIT] = dev[CMD_LIVE] = 0xff;
+			fprintf(stderr, "Pipe error from child.\n");
+			return;
+		}
+	}
+
+	fork_args[2] = (char *)&ram[addr];
+	pid = fork();
+	if(pid < 0) { /* failure */
+		dev[CMD_EXIT] = dev[CMD_LIVE] = 0xff;
+		fprintf(stderr, "Fork failure.\n");
+	} else if(pid == 0) { /* child */
+
+#ifdef __linux__
+		int r = prctl(PR_SET_PDEATHSIG, SIGTERM);
+		if(r == -1) {
+			perror(0);
+			exit(6);
+		}
+		if(getppid() != parent_pid) exit(13);
+#endif
+
+		if(child_mode & 0x01) {
+			dup2(to_child_fd[0], 0);
+			close(to_child_fd[1]);
+		}
+		if(child_mode & (0x04 | 0x02)) {
+			if(child_mode & 0x02) dup2(from_child_fd[1], 1);
+			if(child_mode & 0x04) dup2(from_child_fd[1], 2);
+			close(from_child_fd[0]);
+		}
+		fflush(stdout);
+		execvp(fork_args[0], fork_args);
+		exit(1);
+	} else { /*parent*/
+		child_pid = pid;
+		dev[CMD_LIVE] = 0x01;
+		dev[CMD_EXIT] = 0x00;
+		if(child_mode & 0x01) {
+			saved_out = dup(1);
+			dup2(to_child_fd[1], 1);
+			close(to_child_fd[0]);
+		}
+		if(child_mode & (0x04 | 0x02)) {
+			saved_in = dup(0);
+			dup2(from_child_fd[0], 0);
+			close(from_child_fd[1]);
+		}
+	}
+}
+
+static void
+check_child(void)
+{
+	int wstatus;
+	if(child_pid) {
+		if(waitpid(child_pid, &wstatus, WNOHANG)) {
+			dev[CMD_LIVE] = 0xff;
+			dev[CMD_EXIT] = WEXITSTATUS(wstatus);
+			clean_after_child();
+		} else {
+			dev[CMD_LIVE] = 0x01;
+			dev[CMD_EXIT] = 0x00;
+		}
+	}
+}
+
+static void
+kill_child(void)
+{
+	int wstatus;
+	if(child_pid) {
+		kill(child_pid, 9);
+		if(waitpid(child_pid, &wstatus, WNOHANG)) {
+			dev[CMD_LIVE] = 0xff;
+			dev[CMD_EXIT] = WEXITSTATUS(wstatus);
+			clean_after_child();
+		}
+	}
+}
+
+static void
+console_start_fork(void)
+{
+	fflush(stderr);
+	kill_child();
+	child_mode = dev[CMD_MODE];
+	start_fork_pipe();
+}
+
+static void
+console_close(void)
+{
+	kill_child();
+}
+
+static unsigned int
+console_input(int c, unsigned int type)
+{
+	if(c == EOF) c = 0, type = 4;
+	dev[0x12] = c, dev[0x17] = type;
+	if(console_vector) uxn_eval(console_vector);
+	return type != 4;
+}
+
+/*
+@|Screen ------------------------------------------------------------ */
+
+#define MAR(x) (x + 0x8)
+#define MAR2(x) (x + 0x10)
+
+typedef struct UxnScreen {
+	int width, height, zoom, resized, x1, y1, x2, y2;
+	unsigned int palette[16], *pixels;
+	Uint8 *fg, *bg;
+} UxnScreen;
+
+static unsigned int screen_vector;
+static UxnScreen uxn_screen;
+static const Uint8 blending[4][16] = {
+	{0, 0, 0, 0, 1, 0, 1, 1, 2, 2, 0, 2, 3, 3, 3, 0},
+	{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3},
+	{1, 2, 3, 1, 1, 2, 3, 1, 1, 2, 3, 1, 1, 2, 3, 1},
+	{2, 3, 1, 2, 2, 3, 1, 2, 2, 3, 1, 2, 2, 3, 1, 2}};
+
+void emu_resize(void);
+
+static unsigned int
+screen_changed(void)
+{
+	clamp(uxn_screen.x1, 0, uxn_screen.width);
+	clamp(uxn_screen.y1, 0, uxn_screen.height);
+	clamp(uxn_screen.x2, 0, uxn_screen.width);
+	clamp(uxn_screen.y2, 0, uxn_screen.height);
+	return uxn_screen.x2 > uxn_screen.x1 &&
+		uxn_screen.y2 > uxn_screen.y1;
+}
+
+static void
+screen_change(const int x1, const int y1, const int x2, const int y2)
+{
+	if(x1 < uxn_screen.x1) uxn_screen.x1 = x1;
+	if(y1 < uxn_screen.y1) uxn_screen.y1 = y1;
+	if(x2 > uxn_screen.x2) uxn_screen.x2 = x2;
+	if(y2 > uxn_screen.y2) uxn_screen.y2 = y2;
+}
+
+static void
+screen_palette(void)
+{
+	int i, shift, colors[4];
+	for(i = 0, shift = 4; i < 4; ++i, shift ^= 4) {
+		Uint8
+			r = (dev[0x8 + i / 2] >> shift) & 0xf,
+			g = (dev[0xa + i / 2] >> shift) & 0xf,
+			b = (dev[0xc + i / 2] >> shift) & 0xf;
+		colors[i] = 0x0f000000 | r << 16 | g << 8 | b;
+		colors[i] |= colors[i] << 4;
+	}
+	for(i = 0; i < 16; i++)
+		uxn_screen.palette[i] = colors[(i >> 2) ? (i >> 2) : (i & 3)];
+	screen_change(0, 0, uxn_screen.width, uxn_screen.height);
+}
+
+static void
+screen_apply(int width, int height)
+{
+	int length;
+	clamp(width, 8, 0x800);
+	clamp(height, 8, 0x800);
+	if(width == uxn_screen.width && height == uxn_screen.height)
+		return;
+	length = MAR2(width) * MAR2(height);
+	uxn_screen.bg = realloc(uxn_screen.bg, length), uxn_screen.fg = realloc(uxn_screen.fg, length);
+	memset(uxn_screen.bg, 0, length);
+	memset(uxn_screen.fg, 0, length);
+	uxn_screen.width = width, uxn_screen.height = height, uxn_screen.resized = 1;
+	screen_change(0, 0, width, height);
+}
+
+static void
+screen_redraw(void)
+{
+	int i, x, y, k, l;
+	for(y = uxn_screen.y1; y < uxn_screen.y2; y++) {
+		const int ys = y * uxn_screen.zoom;
+		for(x = uxn_screen.x1, i = MAR(x) + MAR(y) * MAR2(uxn_screen.width); x < uxn_screen.x2; x++, i++) {
+			const int c = uxn_screen.palette[uxn_screen.fg[i] << 2 | uxn_screen.bg[i]];
+			for(k = 0; k < uxn_screen.zoom; k++) {
+				const int oo = ((ys + k) * uxn_screen.width + x) * uxn_screen.zoom;
+				for(l = 0; l < uxn_screen.zoom; l++)
+					uxn_screen.pixels[oo + l] = c;
+			}
+		}
+	}
+	uxn_screen.x1 = uxn_screen.y1 = 9999;
+	uxn_screen.x2 = uxn_screen.y2 = 0;
+}
+
+/* screen registers */
+
+static int rX, rY, rA, rMX, rMY, rMA, rML, rDX, rDY;
+
+static void
+screen_draw_pixel(void)
+{
+	const int ctrl = dev[0x2e];
+	const int color = ctrl & 0x3;
+	const int len = MAR2(uxn_screen.width);
+	Uint8 *layer = ctrl & 0x40 ? uxn_screen.fg : uxn_screen.bg;
+	/* fill mode */
+	if(ctrl & 0x80) {
+		int x1, y1, x2, y2, ax, bx, ay, by, hor, ver;
+		if(ctrl & 0x10)
+			x1 = 0, x2 = rX;
+		else
+			x1 = rX, x2 = uxn_screen.width;
+		if(ctrl & 0x20)
+			y1 = 0, y2 = rY;
+		else
+			y1 = rY, y2 = uxn_screen.height;
+		screen_change(x1, y1, x2, y2);
+		x1 = MAR(x1), y1 = MAR(y1);
+		hor = MAR(x2) - x1, ver = MAR(y2) - y1;
+		for(ay = y1 * len, by = ay + ver * len; ay < by; ay += len)
+			for(ax = ay + x1, bx = ax + hor; ax < bx; ax++)
+				layer[ax] = color;
+	}
+	/* pixel mode */
+	else {
+		if(rX >= 0 && rY >= 0 && rX < len && rY < uxn_screen.height)
+			layer[MAR(rX) + MAR(rY) * len] = color;
+		screen_change(rX, rY, rX + 1, rY + 1);
+		if(rMX) rX++;
+		if(rMY) rY++;
+	}
+}
+
+static void
+screen_draw_sprite(void)
+{
+	const int ctrl = dev[0x2f];
+	const int blend = ctrl & 0xf, opaque = blend % 5;
+	const int fx = ctrl & 0x10 ? -1 : 1, fy = ctrl & 0x20 ? -1 : 1;
+	const int qfx = fx > 0 ? 7 : 0, qfy = fy < 0 ? 7 : 0;
+	const int dxy = fy * rDX, dyx = fx * rDY;
+	const int wmar = MAR(uxn_screen.width), wmar2 = MAR2(uxn_screen.width);
+	const int hmar2 = MAR2(uxn_screen.height);
+	Uint8 *layer = ctrl & 0x40 ? uxn_screen.fg : uxn_screen.bg;
+	int i, x1, x2, y1, y2, ax, ay, qx, qy, x = rX, y = rY;
+	if(ctrl & 0x80) {
+		const int addr_incr = rMA << 2;
+		for(i = 0; i <= rML; i++, x += dyx, y += dxy, rA += addr_incr) {
+			const Uint16 xmar = MAR(x), ymar = MAR(y);
+			const Uint16 xmar2 = MAR2(x), ymar2 = MAR2(y);
+			if(xmar < wmar && ymar2 < hmar2) {
+				const Uint8 *sprite = &ram[rA];
+				const int by = ymar2 * wmar2;
+				for(ay = ymar * wmar2, qy = qfy; ay < by; ay += wmar2, qy += fy) {
+					const int ch1 = sprite[qy], ch2 = sprite[qy + 8] << 1, bx = xmar2 + ay;
+					for(ax = xmar + ay, qx = qfx; ax < bx; ax++, qx -= fx) {
+						const int color = ((ch1 >> qx) & 1) | ((ch2 >> qx) & 2);
+						if(opaque || color) layer[ax] = blending[color][blend];
+					}
+				}
+			}
+		}
+	} else {
+		const int addr_incr = rMA << 1;
+		for(i = 0; i <= rML; i++, x += dyx, y += dxy, rA += addr_incr) {
+			const Uint16 xmar = MAR(x), ymar = MAR(y);
+			const Uint16 xmar2 = MAR2(x), ymar2 = MAR2(y);
+			if(xmar < wmar && ymar2 < hmar2) {
+				const Uint8 *sprite = &ram[rA];
+				const int by = ymar2 * wmar2;
+				for(ay = ymar * wmar2, qy = qfy; ay < by; ay += wmar2, qy += fy) {
+					const int ch1 = sprite[qy], bx = xmar2 + ay;
+					for(ax = xmar + ay, qx = qfx; ax < bx; ax++, qx -= fx) {
+						const int color = (ch1 >> qx) & 1;
+						if(opaque || color) layer[ax] = blending[color][blend];
+					}
+				}
+			}
+		}
+	}
+	if(fx < 0)
+		x1 = x, x2 = rX;
+	else
+		x1 = rX, x2 = x;
+	if(fy < 0)
+		y1 = y, y2 = rY;
+	else
+		y1 = rY, y2 = y;
+	screen_change(x1 - 8, y1 - 8, x2 + 8, y2 + 8);
+	if(rMX) rX += rDX * fx;
+	if(rMY) rY += rDY * fy;
+}
+
+/*
+@|Controller -------------------------------------------------------- */
+
+static unsigned int controller_vector;
+
+static void
+controller_down(Uint8 mask)
+{
+	if(mask) {
+		dev[0x82] |= mask;
+		if(controller_vector) uxn_eval(controller_vector);
+	}
+}
+
+static void
+controller_up(Uint8 mask)
+{
+	if(mask) {
+		dev[0x82] &= (~mask);
+		if(controller_vector) uxn_eval(controller_vector);
+	}
+}
+
+static void
+controller_key(Uint8 key)
+{
+	if(key) {
+		dev[0x83] = key;
+		if(controller_vector) uxn_eval(controller_vector);
+		dev[0x83] = 0;
+	}
+}
+
+/*
+@|Mouse ------------------------------------------------------------- */
+
+static unsigned int mouse_vector;
+
+static void
+mouse_down(Uint8 mask)
+{
+	dev[0x96] |= mask;
+	if(mouse_vector) uxn_eval(mouse_vector);
+}
+
+static void
+mouse_up(Uint8 mask)
+{
+	dev[0x96] &= (~mask);
+	if(mouse_vector) uxn_eval(mouse_vector);
+}
+
+static void
+mouse_pos(Uint16 x, Uint16 y)
+{
+	dev[0x92] = x >> 8, dev[0x93] = x;
+	dev[0x94] = y >> 8, dev[0x95] = y;
+	if(mouse_vector) uxn_eval(mouse_vector);
+}
+
+static void
+mouse_scroll(Uint16 x, Uint16 y)
+{
+	dev[0x9a] = x >> 8, dev[0x9b] = x;
+	dev[0x9c] = -y >> 8, dev[0x9d] = -y;
+	if(mouse_vector) uxn_eval(mouse_vector);
+	dev[0x9a] = 0, dev[0x9b] = 0;
+	dev[0x9c] = 0, dev[0x9d] = 0;
+}
+
+/*
+@|File -------------------------------------------------------------- */
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+typedef struct {
+	FILE *f;
+	DIR *dir;
+	char *filepath;
+	enum { IDLE,
+		FILE_READ,
+		FILE_WRITE,
+		DIR_READ,
+		DIR_WRITE
+	} state;
+} UxnFile;
+
+static UxnFile ufs[2];
+static Uint8 dirbuf[0x10000], *_dirbuf = dirbuf;
+
+static void
+make_pathfile(char *pathbuf, const char *filepath, const char *basename)
+{
+	char c = '/';
+	while(*filepath)
+		c = *filepath++, *pathbuf = c, pathbuf++;
+	if(c != '/')
+		*pathbuf = '/', pathbuf++;
+	while(*basename)
+		*pathbuf = *basename++, pathbuf++;
+	*pathbuf = 0;
+}
+
+static unsigned int
+put_fill(Uint8 *dest, unsigned int len, char c)
+{
+	unsigned int i;
+	for(i = 0; i < len; i++)
+		*dest = c, dest++;
+	return len;
+}
+
+static unsigned int
+put_size(Uint8 *dest, unsigned int len, unsigned int size)
+{
+	unsigned int i;
+	for(i = 0, dest += len; i < len; i++, size >>= 4)
+		*(--dest) = "0123456789abcdef"[(Uint8)(size & 0xf)];
+	return len;
+}
+
+static unsigned int
+put_text(Uint8 *dest, const char *text)
+{
+	Uint8 *anchor = dest;
+	while(*text)
+		*dest = *text++, dest++;
+	*dest = 0;
+	return dest - anchor;
+}
+
+static unsigned int
+put_stat(Uint8 *dest, unsigned int len, unsigned int size, unsigned int err, unsigned int dir, unsigned int capsize)
+{
+	if(err) return put_fill(dest, len, '!');
+	if(dir) return put_fill(dest, len, '-');
+	if(capsize && size >= 0x10000) return put_fill(dest, len, '?');
+	return put_size(dest, len, size);
+}
+
+static unsigned int
+put_statfile(Uint8 *dest, const char *filepath, const char *basename)
+{
+	unsigned int err, dir;
+	struct stat st;
+	Uint8 *anchor = dest;
+	char pathbuf[0x2000];
+	make_pathfile(pathbuf, filepath, basename);
+	err = stat(pathbuf, &st);
+	dir = S_ISDIR(st.st_mode);
+	dest += put_stat(dest, 4, st.st_size, err, dir, 1);
+	dest += put_text(dest, " ");
+	dest += put_text(dest, basename);
+	dest += put_text(dest, dir ? "/\n" : "\n");
+	return dest - anchor;
+}
+
+static unsigned int
+put_fdir(Uint8 *dest, unsigned int len, const char *filepath, DIR *dir)
+{
+	unsigned int i;
+	struct dirent *de = readdir(dir);
+	for(_dirbuf = dirbuf; de != NULL; de = readdir(dir)) {
+		const char *name = de->d_name;
+		if(name[0] == '.' && (name[1] == '.' || name[1] == '\0'))
+			continue;
+		else
+			_dirbuf += put_statfile(_dirbuf, filepath, name);
+	}
+	for(i = 0; i < len && dirbuf[i]; i++)
+		dest[i] = dirbuf[i];
+	dest[i] = 0;
+	return i;
+}
+
+static unsigned int
+is_dir_path(char *p)
+{
+	char c;
+	unsigned int saw_slash = 0;
+	while((c = *p++)) saw_slash = c == '/';
+	return saw_slash;
+}
+
+static unsigned int
+is_dir_real(char *p)
+{
+	struct stat st;
+	return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static unsigned int
+file_write_dir(char *p)
+{
+	unsigned int ok = 1;
+	char c, *s = p;
+	for(; ok && (c = *p); p++) {
+		if(c == '/') {
+			*p = '\0';
+			ok = is_dir_real(s) || (mkdir(s, 0755) == 0);
+			*p = c;
+		}
+	}
+	return ok;
+}
+
+static void
+file_reset(unsigned int id)
+{
+	if(ufs[id].f != NULL) fclose(ufs[id].f), ufs[id].f = NULL;
+	if(ufs[id].dir != NULL) closedir(ufs[id].dir), ufs[id].dir = NULL;
+	ufs[id].state = IDLE;
+}
+
+static unsigned int
+file_init(unsigned int id, Uint16 addr)
+{
+	file_reset(id);
+	ufs[id].filepath = (char *)&ram[addr];
+	return 0;
+}
+
+static unsigned int
+file_not_ready(unsigned int id)
+{
+	if(ufs[id].filepath == 0) {
+		fprintf(stderr, "File %d is uninitialized\n", id);
+		return 1;
+	} else
+		return 0;
+}
+
+static unsigned int
+file_read(unsigned int id, Uint16 addr, unsigned int len)
+{
+	void *dest = &ram[addr];
+	if(file_not_ready(id))
+		return 0;
+	if(ufs[id].state != FILE_READ && ufs[id].state != DIR_READ) {
+		file_reset(id);
+		if((ufs[id].dir = opendir(ufs[id].filepath)) != NULL)
+			ufs[id].state = DIR_READ;
+		else if((ufs[id].f = fopen(ufs[id].filepath, "rb")) != NULL)
+			ufs[id].state = FILE_READ;
+	}
+	if(ufs[id].state == FILE_READ)
+		return fread(dest, 1, len, ufs[id].f);
+	if(ufs[id].state == DIR_READ)
+		return put_fdir(dest, len, ufs[id].filepath, ufs[id].dir);
+	return 0;
+}
+
+static unsigned int
+file_write(unsigned int id, Uint16 addr, unsigned int len, Uint8 flags)
+{
+	unsigned int ret = 0;
+	if(file_not_ready(id))
+		return 0;
+	file_write_dir(ufs[id].filepath);
+	if(ufs[id].state != FILE_WRITE && ufs[id].state != DIR_WRITE) {
+		file_reset(id);
+		if(is_dir_path(ufs[id].filepath))
+			ufs[id].state = DIR_WRITE;
+		else if((ufs[id].f = fopen(ufs[id].filepath, (flags & 0x01) ? "ab" : "wb")) != NULL)
+			ufs[id].state = FILE_WRITE;
+	}
+	if(ufs[id].state == FILE_WRITE)
+		if((ret = fwrite(&ram[addr], 1, len, ufs[id].f)) > 0 && fflush(ufs[id].f) != 0)
+			ret = 0;
+	if(ufs[id].state == DIR_WRITE)
+		ret = is_dir_real(ufs[id].filepath);
+	return ret;
+}
+
+static unsigned int
+file_stat(unsigned int id, Uint16 addr, unsigned int len)
+{
+	unsigned int err, dir;
+	struct stat st;
+	if(file_not_ready(id))
+		return 0;
+	err = stat(ufs[id].filepath, &st);
+	dir = S_ISDIR(st.st_mode);
+	return put_stat(&ram[addr], len, st.st_size, err, dir, 0);
+}
+
+static unsigned int
+file_delete(unsigned int id)
+{
+	if(file_not_ready(id))
+		return -1;
+	return unlink(ufs[id].filepath);
+}
+
+static void
+file_success(unsigned int port, unsigned int value)
+{
+	POKE2(&dev[port], value);
+}
+
+/* file registers */
+
+static unsigned int rL1, rL2;
+
+/*
+@|Datetime ---------------------------------------------------------- */
+
+#include <time.h>
+
+/*
+@|Core -------------------------------------------------------------- */
+
+#define CONINBUFSIZE 256
+
+Uint8
+emu_dei(const Uint8 port)
+{
+	switch(port) {
+	/* System */
+	case 0x04: return wst.ptr;
+	case 0x05: return rst.ptr;
+	/* Console */
+	case CMD_LIVE:
+	case CMD_EXIT: check_child(); break;
+	/* Screen */
+	case 0x22: return uxn_screen.width >> 8;
+	case 0x23: return uxn_screen.width;
+	case 0x24: return uxn_screen.height >> 8;
+	case 0x25: return uxn_screen.height;
+	case 0x28: return rX >> 8;
+	case 0x29: return rX;
+	case 0x2a: return rY >> 8;
+	case 0x2b: return rY;
+	case 0x2c: return rA >> 8;
+	case 0x2d: return rA;
+	}
+	if((port & 0xf0) == 0xc0) {
+		time_t seconds = time(NULL);
+		struct tm zt = {0};
+		struct tm *t = localtime(&seconds);
+		if(t == NULL) t = &zt;
+		switch(port) {
+		case 0xc0: return (t->tm_year + 1900) >> 8;
+		case 0xc1: return (t->tm_year + 1900);
+		case 0xc2: return t->tm_mon;
+		case 0xc3: return t->tm_mday;
+		case 0xc4: return t->tm_hour;
+		case 0xc5: return t->tm_min;
+		case 0xc6: return t->tm_sec;
+		case 0xc7: return t->tm_wday;
+		case 0xc8: return t->tm_yday >> 8;
+		case 0xc9: return t->tm_yday;
+		case 0xca: return t->tm_isdst;
+		}
+	}
+	return dev[port];
+}
+
+void
+emu_deo(const Uint8 port, const Uint8 value)
+{
+	// Call Rust hook for all port events
+	rust_deo_all_ports_hook(port, value);
+	dev[port] = value;
+	switch(port) {
+	/* System */
+	case 0x03: system_expansion(PEEK2(dev + 2)); return;
+	case 0x04: wst.ptr = dev[4]; return;
+	case 0x05: rst.ptr = dev[5]; return;
+	case 0x08:
+	case 0x09:
+	case 0x0a:
+	case 0x0b:
+	case 0x0c:
+	case 0x0d: screen_palette(); return;
+	case 0x0e: system_print("WST", &wst), system_print("RST", &rst); return;
+	/* Console */
+	case 0x11: console_vector = PEEK2(&dev[0x10]); return;
+	case 0x18: fputc(dev[0x18], stdout), fflush(stdout); return;
+	case 0x19: fputc(dev[0x19], stderr), fflush(stderr); return;
+	case 0x1f: console_start_fork(); return;
+	/* Screen */
+	case 0x21: screen_vector = PEEK2(&dev[0x20]); return;
+	case 0x23: screen_apply(PEEK2(&dev[0x22]), uxn_screen.height); return;
+	case 0x25: screen_apply(uxn_screen.width, PEEK2(&dev[0x24])); return;
+	case 0x26: rMX = dev[0x26] & 0x1, rMY = dev[0x26] & 0x2, rMA = dev[0x26] & 0x4, rML = dev[0x26] >> 4, rDX = rMX << 3, rDY = rMY << 2; return;
+	case 0x28:
+	case 0x29: rX = (dev[0x28] << 8) | dev[0x29], rX = twos(rX); return;
+	case 0x2a:
+	case 0x2b: rY = (dev[0x2a] << 8) | dev[0x2b], rY = twos(rY); return;
+	case 0x2c:
+	case 0x2d: rA = (dev[0x2c] << 8) | dev[0x2d]; return;
+	case 0x2e: screen_draw_pixel(); return;
+	case 0x2f: screen_draw_sprite(); return;
+	/* Controller */
+	case 0x81: controller_vector = PEEK2(&dev[0x80]); return;
+	/* Mouse */
+	case 0x91: mouse_vector = PEEK2(&dev[0x90]); return;
+	/* File 1 */
+	case 0xab: rL1 = PEEK2(&dev[0xaa]); return;
+	case 0xa5: file_success(0xa2, file_stat(0, PEEK2(&dev[0xa4]), rL1)); return;
+	case 0xa6: file_success(0xa2, file_delete(0)); return;
+	case 0xa9: file_success(0xa2, file_init(0, PEEK2(&dev[0xa8]))); return;
+	case 0xad: file_success(0xa2, file_read(0, PEEK2(&dev[0xac]), rL1)); return;
+	case 0xaf: file_success(0xa2, file_write(0, PEEK2(&dev[0xae]), rL1, dev[0xa7])); return;
+	/* File 2 */
+	case 0xbb: rL2 = PEEK2(&dev[0xba]); return;
+	case 0xb5: file_success(0xb2, file_stat(1, PEEK2(&dev[0xb4]), rL2)); return;
+	case 0xb6: file_success(0xb2, file_delete(1)); return;
+	case 0xb9: file_success(0xb2, file_init(1, PEEK2(&dev[0xb8]))); return;
+	case 0xbd: file_success(0xb2, file_read(1, PEEK2(&dev[0xbc]), rL2)); return;
+	case 0xbf: file_success(0xb2, file_write(1, PEEK2(&dev[0xbe]), rL2, dev[0xb7])); return;
+	}
+}
+
+static void
+emu_repaint(void)
+{
+	const int x = uxn_screen.x1 * uxn_screen.zoom;
+	const int y = uxn_screen.y1 * uxn_screen.zoom;
+	const int w = uxn_screen.x2 * uxn_screen.zoom - x;
+	const int h = uxn_screen.y2 * uxn_screen.zoom - y;
+	screen_redraw();
+	XPutImage(display, window, DefaultGC(display, 0), ximage, x, y, x, y, w, h);
+}
+
+void
+emu_resize(void)
+{
+	const int width = uxn_screen.width * uxn_screen.zoom;
+	const int height = uxn_screen.height * uxn_screen.zoom;
+	XResizeWindow(display, window, width, height);
+	uxn_screen.pixels = realloc(uxn_screen.pixels,
+		uxn_screen.width * uxn_screen.height * sizeof(unsigned int) * uxn_screen.zoom * uxn_screen.zoom);
+	if(ximage)
+		free(ximage);
+	ximage = XCreateImage(display, DefaultVisual(display, 0), DefaultDepth(display, DefaultScreen(display)), ZPixmap, 0, (char *)uxn_screen.pixels, width, height, 32, 0);
+	uxn_screen.x1 = uxn_screen.y1 = 0;
+	uxn_screen.x2 = uxn_screen.width;
+	uxn_screen.y2 = uxn_screen.height;
+	emu_repaint();
+}
+
+static void
+emu_restart(unsigned int soft)
+{
+	console_close();
+	screen_apply(WIDTH, HEIGHT);
+	system_reboot(soft);
+	uxn_eval(0x100);
+}
+
+static void
+emu_rescale(void)
+{
+	uxn_screen.zoom = uxn_screen.zoom >= 3 ? 1 : uxn_screen.zoom + 1;
+	uxn_screen.resized = 1;
+}
+
+static Uint8
+get_button(KeySym sym)
+{
+	switch(sym) {
+	case XK_Up: return 0x10;
+	case XK_Down: return 0x20;
+	case XK_Left: return 0x40;
+	case XK_Right: return 0x80;
+	case XK_Control_L: return 0x01;
+	case XK_Alt_L: return 0x02;
+	case XK_Shift_L: return 0x04;
+	case XK_Home: return 0x08;
+	case XK_Meta_L: return 0x02;
+	}
+	return 0x00;
+}
+
+static void
+display_hidecursor(void)
+{
+	XColor black = {0};
+	char empty[] = {0};
+	Pixmap bitmap = XCreateBitmapFromData(display, window, empty, 1, 1);
+	Cursor blank = XCreatePixmapCursor(display, bitmap, bitmap, &black, &black, 0, 0);
+	XDefineCursor(display, window, blank);
+	XFreeCursor(display, blank);
+	XFreePixmap(display, bitmap);
+}
+
+static void
+display_floating(Display *dpy, Window win)
+{
+	Atom wmDelete = XInternAtom(display, "WM_DELETE_WINDOW", True);
+	Atom wmType = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+	Atom wmDialog = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+	XSetWMProtocols(display, window, &wmDelete, 1);
+	XChangeProperty(dpy, win, wmType, 4, 32, PropModeReplace, (Uint8 *)&wmDialog, 1);
+}
+
+static unsigned int
+display_init(void)
+{
+	Screen *screen;
+	Visual *visual;
+	XClassHint class = {"uxn11", "Uxn"};
+	int screen_width, screen_height;
+	/* start display */
+	display = XOpenDisplay(NULL);
+	if(!display)
+		return !fprintf(stderr, "Display: failed\n");
+	/* start window */
+	visual = DefaultVisual(display, 0);
+	if(visual->class != TrueColor)
+		return !fprintf(stderr, "Display: True-color visual failed\n");
+	/* center */
+	screen = ScreenOfDisplay(display, 0);
+	screen_width = screen->width, screen_height = screen->height;
+	window = XCreateSimpleWindow(display, RootWindow(display, 0), screen_width / 2 - uxn_screen.width / 2, screen_height / 2 - uxn_screen.height / 2, uxn_screen.width, uxn_screen.height, 1, 0, 0);
+	display_hidecursor();
+	display_floating(display, window);
+	XSelectInput(display, window, ButtonPressMask | ButtonReleaseMask | PointerMotionMask | ExposureMask | KeyPressMask | KeyReleaseMask | LeaveWindowMask);
+	XStoreName(display, window, "uxn11");
+	XSetClassHint(display, window, &class);
+	XMapWindow(display, window);
+	return 1;
+}
+
+static void
+emu_event(void)
+{
+	char buf[7];
+	XEvent ev;
+	XNextEvent(display, &ev);
+	switch(ev.type) {
+	case Expose:
+		screen_change(0, 0, 9000, 9000);
+		break;
+	case ClientMessage:
+		dev[0x0f] = 0x80;
+		break;
+	case KeyPress: {
+		KeySym sym;
+		XLookupString((XKeyPressedEvent *)&ev, buf, 7, &sym, 0);
+		switch(sym) {
+		case XK_F1: emu_rescale(); break;
+		case XK_F2: emu_deo(0xe, 0x1); break;
+		case XK_F4: emu_restart(0); break;
+		case XK_F5: emu_restart(1); break;
+		}
+		controller_down(get_button(sym));
+		if(XLookupKeysym((XKeyPressedEvent *)&ev, 0) == XK_Tab)
+			buf[0] = 0x9;
+		controller_key(sym < 0x80 ? sym : (Uint8)buf[0]);
+	} break;
+	case KeyRelease: {
+		KeySym sym;
+		XLookupString((XKeyPressedEvent *)&ev, buf, 7, &sym, 0);
+		controller_up(get_button(sym));
+	} break;
+	case ButtonPress: {
+		XButtonPressedEvent *e = (XButtonPressedEvent *)&ev;
+		switch(e->button) {
+		case 4: mouse_scroll(0, 1); break;
+		case 5: mouse_scroll(0, -1); break;
+		case 6: mouse_scroll(1, 0); break;
+		case 7: mouse_scroll(-1, 0); break;
+		default: mouse_down(0x1 << (e->button - 1));
+		}
+	} break;
+	case ButtonRelease: {
+		XButtonPressedEvent *e = (XButtonPressedEvent *)&ev;
+		mouse_up(0x1 << (e->button - 1));
+	} break;
+	case LeaveNotify:
+	case MotionNotify: {
+		XMotionEvent *e = (XMotionEvent *)&ev;
+		mouse_pos(e->x / uxn_screen.zoom, e->y / uxn_screen.zoom);
+	} break;
+	}
+}
+
+static void
+emu_run(void)
+{
+	int has_input, has_eof;
+	char expirations[8], coninp[CONINBUFSIZE];
+	static const struct itimerspec screen_tspec = {{0, 16666666}, {0, 16666666}};
+	struct pollfd fds[3];
+	/* timer */
+	fds[0].fd = XConnectionNumber(display);
+	fds[1].fd = timerfd_create(CLOCK_MONOTONIC, 0);
+	timerfd_settime(fds[1].fd, 0, &screen_tspec, NULL);
+	fds[2].fd = STDIN_FILENO;
+	fds[0].events = fds[1].events = fds[2].events = POLLIN;
+	/* main loop */
+	while(!dev[0x0f]) {
+		if(poll(fds, 3, 1000) <= 0)
+			continue;
+		while(XPending(display))
+			emu_event();
+		if(poll(&fds[1], 1, 0)) {
+			read(fds[1].fd, expirations, 8);
+			if(screen_vector)
+				uxn_eval(screen_vector);
+			if(uxn_screen.resized)
+				emu_resize(), uxn_screen.resized = 0;
+			if(uxn_screen.x2 && uxn_screen.y2 && screen_changed())
+				emu_repaint();
+		}
+		has_input = fds[2].revents & POLLIN;
+		has_eof = fds[2].revents & POLLHUP;
+		if(has_input || has_eof) {
+			int i = 1, n = read(fds[2].fd, coninp, CONINBUFSIZE - 1);
+			for(i = 0, coninp[n] = 0; i < n; i++)
+				console_input(coninp[i], CONSOLE_STD);
+			if(n == 0)
+				console_input(0, CONSOLE_STD);
+		}
+	}
+	if(ximage)
+		XDestroyImage(ximage);
+	XDestroyWindow(display, window);
+	XCloseDisplay(display);
+}
+
+// Exported entry point for FFI
+#ifdef __cplusplus
+extern "C" {
+#endif
+int uxn11_entry(int argc, char **argv)
+{
+	int i = 1;
+	if(argc == 2 && argv[1][0] == '-' && argv[1][1] == 'v')
+		return !fprintf(stdout, "Uxn11 - Varvara Emulator, 19 Jul 2025.\n");
+	else if(argc == 1)
+		return !fprintf(stdout, "usage: %s [-v] file.rom [args..]\n", argv[0]);
+	else if(!system_boot(argv[i++], argc > 2))
+		return !fprintf(stdout, "Could not load %s.\n", argv[i - 1]);
+	uxn_screen.zoom = 1;
+	screen_apply(WIDTH, HEIGHT);
+	if(uxn_eval(0x100) && console_vector) {
+		for(; i < argc; i++) {
+			char *p = argv[i];
+			while(*p)
+				console_input(*p++, CONSOLE_ARG);
+			console_input('\n', i == argc - 1 ? CONSOLE_END : CONSOLE_EOA);
+		}
+	}
+	if(!display_init())
+		return !fprintf(stdout, "Could not open display.\n");
+	emu_run();
+	console_close();
+	return dev[0x0f] & 0x7f;
+}
+#ifdef __cplusplus
+}
+#endif
+
+

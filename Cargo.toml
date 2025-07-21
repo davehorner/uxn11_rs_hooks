@@ -1,0 +1,17 @@
+[package]
+name = "uxn11_rust_hooks"
+version = "0.1.0"
+edition = "2021"
+
+
+[lib]
+name = "uxn11_rust_hooks_lib"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "uxn11_rust_hooks"
+path = "src/main.rs"
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.72"
